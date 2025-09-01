@@ -1,324 +1,239 @@
 """
-Telegram İstek Onaylayıcı Bot (PTB 21.7) — DM'den yönetim
-
-Özellikler:
-- Katılma isteği geldiğinde adminlere özelden buton gönderir (✅/❌).
-- DM'den toplu onay/ret komutları: /approveall, /declineall
-- Eski bekleyenleri DM’den /syncrequests ile içeri alabilirsin (opsiyonel).
-- Rate limit'e saygı (RetryAfter yakalanır), otomatik bekler ve devam eder.
-
-ENV:
-  BOT_TOKEN        -> Telegram bot token (zorunlu)
-  ADMIN_IDS        -> Virgülle ayrılmış admin user_id listesi. Örn: "111,222"
-  WELCOME_MESSAGE  -> (opsiyonel) Tek tek onaydan sonra gruba atılır. {mention} destekler.
-  MAX_RATE_PER_SEC -> (opsiyonel) saniyede en fazla işlem (vars: 10)
+Telegram İstek Onaylayıcı (DM’den toplu onay)
+- Kütüphane: python-telegram-bot==21.7
+- Çalıştırma:
+  BOT_TOKEN=xxxxx ADMIN_IDS=111,222 WELCOME_MESSAGE="..." python app.py
 """
-
-from __future__ import annotations
 
 import asyncio
 import logging
 import os
-import time
-from typing import Dict, Tuple, List, Optional
+from typing import Dict, Set, List, Tuple, Optional
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup, User
+)
 from telegram.constants import ParseMode
-from telegram.error import RetryAfter, Forbidden, BadRequest, TimedOut, NetworkError
+from telegram.error import RetryAfter, Forbidden
 from telegram.ext import (
-    Application,
-    ChatJoinRequestHandler,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, CallbackQueryHandler, ChatJoinRequestHandler,
+    ContextTypes
 )
 
-# ---------- Ayarlar ----------
+# ---------- Ayarlar / Log ----------
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_IDS: List[int] = [int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x]
+ADMIN_IDS: Set[int] = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x}
 WELCOME_MESSAGE = os.getenv(
     "WELCOME_MESSAGE",
-    "🎉 {mention} hoş geldin! Kuralları /kurallar ile görebilirsin.",
+    "{mention} hoş geldin! Grup kurallarını /kurallar komutuyla görebilirsin.",
 )
-MAX_RATE_PER_SEC = float(os.getenv("MAX_RATE_PER_SEC", "10"))
 
 if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN env değişkeni zorunludur.")
 
-# Bekleyen istek havuzu: user_id -> (chat_id, user)
-pending_requests: Dict[int, Tuple[int, "telegram.User"]] = {}
+# ---------- Çalışma durumları ----------
+# Bot çalışırken gördüğü bekleyen istekler:
+# pending[(chat_id)][user_id] = User
+pending: Dict[int, Dict[int, User]] = {}
 
-# Basit oran sınırlama
-_last_ops: List[float] = []
-def _record_op():
-    now = time.time()
-    _last_ops.append(now)
-    while _last_ops and now - _last_ops[0] > 1.0:
-        _last_ops.pop(0)
+# Botun çalışırken istek aldığı sohbetleri (başlıkla) da tutalım:
+known_chats: Dict[int, str] = {}
 
-async def _rate_limit():
-    while True:
-        now = time.time()
-        _last_ops[:] = [t for t in _last_ops if now - t <= 1.0]
-        if len(_last_ops) < MAX_RATE_PER_SEC:
-            _record_op()
-            return
-        await asyncio.sleep(0.02)
+# Şu an seçim yapılmış sohbet (admin bazlı saklıyoruz)
+selected_chat_by_admin: Dict[int, int] = {}
 
-def _is_admin(uid: int) -> bool:
-    return uid in ADMIN_IDS
+# ---------- Yardımcılar ----------
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def _resolve_chat_id(update: Update, args: List[str]) -> Optional[int]:
-    """DM'de çalışıyorsan args'tan, grupta çalışıyorsan otomatik chat_id alır."""
-    chat = update.effective_chat
-    if chat and chat.type in ("group", "supergroup", "channel"):
-        return chat.id
-    # DM ise argümandan bekle
-    for tok in reversed(args):
-        try:
-            return int(tok)
-        except ValueError:
-            continue
-    return None
+def rate_to_delay(rate_name: str) -> float:
+    name = (rate_name or "").lower()
+    if name in ("hizli", "fast"):
+        return 0.045   # ~22/sn
+    if name in ("orta", "medium"):
+        return 0.08    # ~12/sn
+    # varsayılan + yavaş
+    return 0.2        # ~5/sn
 
-# ---------- Yardımcı işlemler ----------
-async def safe_approve(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    retries = 0
-    while True:
-        try:
-            await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=user_id)
-            return True
-        except RetryAfter as e:
-            await asyncio.sleep(int(getattr(e, "retry_after", 3)) or 3)
-        except (TimedOut, NetworkError):
-            await asyncio.sleep(2)
-        except Forbidden:
-            logger.error("Forbidden: Botun yetkisi yok (Üyelik isteklerini yönet).")
-            return False
-        except BadRequest as e:
-            logger.warning("BadRequest approve: %s", e)
-            return False
-        except Exception as e:
-            logger.exception("approve err: %s", e)
-            return False
-        retries += 1
-        if retries > 8:
-            return False
+def mention_html(u: User) -> str:
+    return f"<a href='tg://user?id={u.id}'>{u.first_name}</a>"
 
-async def safe_decline(context: ContextTypes.DEFAULT_TYPE, chat_id: int, user_id: int) -> bool:
-    try:
-        await context.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-        return True
-    except RetryAfter as e:
-        await asyncio.sleep(int(getattr(e, "retry_after", 3)) or 3)
-        try:
-            await context.bot.decline_chat_join_request(chat_id=chat_id, user_id=user_id)
-            return True
-        except Exception:
-            return False
-    except Forbidden:
-        return False
-    except Exception:
-        return False
-
-# ---------- Temel komutlar ----------
+# ---------- Komutlar (DM) ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "Merhaba! Ben onay botuyum.\n"
-        "• /id → kendi user_id'in\n"
-        "• /status <chat_id> → bekleyen sayısı\n"
-        "• /syncrequests <chat_id> → bekleyenleri içeri yükle\n"
-        "• /approveall [adet] <chat_id> → toplu onay\n"
-        "• /declineall [adet] <chat_id> → toplu ret\n"
-        "(Tüm toplu komutları DM'den verebilirsin.)"
+        "Merhaba! İstek onay botu.\n"
+        "/istek → gördüğüm kanallar\n"
+        "/sec <numara> → kanalı seç\n"
+        "/onayla all [hiz] → tümünü onayla\n"
+        "/onayla <adet> [hiz] → belirtilen sayıda onayla\n"
+        "Hızlar: yavas | orta | hizli"
     )
 
-async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    u = update.effective_user
-    await update.message.reply_html(
-        f"🆔 <b>{u.id}</b>\n👤 {u.full_name}\n@{u.username or '-'}"
-    )
-
-# ---------- Join request geldiğinde (gerçek zamanlı) ----------
-async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    req = update.chat_join_request
-    user = req.from_user
-    chat = req.chat
-
-    pending_requests[user.id] = (chat.id, user)
-
-    kb = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("✅ Onayla", callback_data=f"approve:{chat.id}:{user.id}"),
-            InlineKeyboardButton("❌ Reddet",  callback_data=f"decline:{chat.id}:{user.id}"),
-        ]]
-    )
+async def chatid_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat = update.effective_chat
     text = (
-        f"📩 Yeni istek: <a href='tg://user?id={user.id}'>{user.full_name}</a> "
-        f"(@{user.username or '-'} / <code>{user.id}</code>)\n"
-        f"Chat: <code>{chat.title}</code> (<code>{chat.id}</code>)"
+        f"🆔 Chat ID: <code>{chat.id}</code>\n"
+        f"📌 Başlık: {chat.title or '-'}\n"
+        f"👥 Tür: {chat.type}"
     )
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(admin_id, text, reply_markup=kb, parse_mode=ParseMode.HTML)
-        except Exception as e:
-            logger.warning("Admin DM hatası: %s", e)
+    await update.message.reply_html(text)
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    q = update.callback_query
-    await q.answer()
-    if not _is_admin(update.effective_user.id):
-        return await q.edit_message_text("⛔ Yetkisiz.")
+async def istek_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return await update.message.reply_text("⛔ Yetkin yok.")
+
+    if not known_chats:
+        return await update.message.reply_text("Şu ana kadar istek aldığım bir sohbet görmedim.")
+
+    lines = []
+    for i, (cid, title) in enumerate(known_chats.items(), start=1):
+        count = len(pending.get(cid, {}))
+        lines.append(f"{i}. {title} ({cid}) – bekleyen: {count}")
+
+    await update.message.reply_text(
+        "Gördüğüm sohbetler (çalıştığım süre içinde):\n" + "\n".join(lines) +
+        "\n\n/seç <numara> ile birini seç."
+    )
+
+# Türkçe alias: /sec ve /seç ikisini de tutalım
+async def sec_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return await update.message.reply_text("⛔ Yetkin yok.")
+
+    if not context.args:
+        return await update.message.reply_text("Kullanım: /sec <numara>")
+
     try:
-        action, chat_id_s, user_id_s = q.data.split(":")
-        chat_id = int(chat_id_s); user_id = int(user_id_s)
+        idx = int(context.args[0]) - 1
     except ValueError:
-        return await q.edit_message_text("Hatalı veri.")
-    tup = pending_requests.pop(user_id, None)
-    if tup and tup[0] != chat_id:
-        return await q.edit_message_text("Veri uyuşmuyor.")
-    if action == "approve":
-        await _rate_limit()
-        ok = await safe_approve(context, chat_id, user_id)
-        if ok and tup:
-            mention = f"<a href='tg://user?id={user_id}'>{tup[1].first_name}</a>"
-            msg = WELCOME_MESSAGE.format(mention=mention)
+        return await update.message.reply_text("Numara bekleniyordu: /sec 1")
+
+    items = list(known_chats.items())
+    if not (0 <= idx < len(items)):
+        return await update.message.reply_text("Geçersiz numara.")
+
+    chat_id, title = items[idx]
+    selected_chat_by_admin[user.id] = chat_id
+    await update.message.reply_text(f"Seçildi: {title} ({chat_id}).\n"
+                                    f"Bekleyen: {len(pending.get(chat_id, {}))}\n"
+                                    f"`/onayla all hizli` veya `/onayla 500 orta` gibi.", parse_mode=ParseMode.MARKDOWN)
+
+async def onayla_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not is_admin(user.id):
+        return await update.message.reply_text("⛔ Yetkin yok.")
+
+    chat_id = selected_chat_by_admin.get(user.id)
+    if not chat_id:
+        return await update.message.reply_text("Önce bir sohbet seç: /istek → /sec <numara>")
+
+    # Argümanlar: all [hiz]  |  <adet> [hiz]
+    args = context.args or []
+    if not args:
+        return await update.message.reply_text("Kullanım: /onayla all [hiz]  veya  /onayla <adet> [hiz]")
+
+    count: Optional[int] = None
+    speed = "orta"
+
+    if args[0].lower() == "all":
+        count = None
+        if len(args) >= 2:
+            speed = args[1]
+    else:
+        try:
+            count = int(args[0])
+        except ValueError:
+            return await update.message.reply_text("Sayı veya 'all' bekleniyordu.")
+        if len(args) >= 2:
+            speed = args[1]
+
+    delay = rate_to_delay(speed)
+    users_map = pending.get(chat_id, {})
+    if not users_map:
+        return await update.message.reply_text("Bekleyen istek yok (bot çalışırken hiç gelmemiş olabilir).")
+
+    to_process: List[Tuple[int, User]] = list(users_map.items())
+    if count is not None:
+        to_process = to_process[: max(0, count)]
+
+    approved = 0
+    msg = await update.message.reply_text(f"Onay başlıyor… hedef: {len(to_process)} | hız: {speed}")
+
+    for uid, u in to_process:
+        try:
+            await context.bot.approve_chat_join_request(chat_id=chat_id, user_id=uid)
+            # Hoş geldin mesajı
             try:
-                await context.bot.send_message(chat_id, msg, parse_mode=ParseMode.HTML)
+                welcome = WELCOME_MESSAGE.format(mention=mention_html(u))
+                await context.bot.send_message(chat_id=chat_id, text=welcome, parse_mode=ParseMode.HTML)
+            except Forbidden:
+                pass
+            approved += 1
+            users_map.pop(uid, None)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except Exception as e:
+            logger.warning("Onay hatası: %s", e)
+        # hız kontrolü
+        await asyncio.sleep(delay)
+
+        # ara durum güncellemesi (seyrek)
+        if approved % 200 == 0:
+            try:
+                await msg.edit_text(f"Onaylanıyor… {approved}/{len(to_process)}")
             except Exception:
                 pass
-        await q.edit_message_text("✅ Onaylandı." if ok else "⚠️ Onay hatası.")
-    else:
-        await _rate_limit()
-        ok = await safe_decline(context, chat_id, user_id)
-        await q.edit_message_text("❌ Reddedildi." if ok else "⚠️ Ret hatası.")
 
-# ---------- DM’den toplu senkron & sayım ----------
-async def syncrequests(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        return await update.message.reply_text("⛔ Yetkisiz.")
-    chat_id = _resolve_chat_id(update, context.args)
-    if chat_id is None:
-        return await update.message.reply_text("Kullanım: /syncrequests <chat_id>")
-    try:
-        reqs = await context.bot.get_chat_join_requests(chat_id=chat_id, limit=200)
-    except Exception as e:
-        return await update.message.reply_text(f"Hata: {e}")
-    added = 0
-    for r in reqs:
-        if r.user.id not in pending_requests:
-            pending_requests[r.user.id] = (chat_id, r.user)
-            added += 1
-    await update.message.reply_text(f"🔄 Eklendi: {added} | Toplam bekleyen (bellek): {len(pending_requests)}")
+    await msg.edit_text(f"✅ Bitti. Onaylanan: {approved}")
 
-async def status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    chat_id = _resolve_chat_id(update, context.args)
-    if chat_id is None:
-        return await update.message.reply_text("Kullanım: /status <chat_id>")
-    try:
-        reqs = await context.bot.get_chat_join_requests(chat_id=chat_id, limit=1)
-        # Bot API toplam sayıyı direkt döndürmüyor; kaba tahmin: ilk sayfayı saymak istersen burada 200'e kadar çekip len() alınabilir.
-        approx = len(reqs)
-        await update.message.reply_text(f"⚙️ İlk sayfada bekleyen ~{approx} (toplam daha fazla olabilir).")
-    except Exception as e:
-        await update.message.reply_text(f"Hata: {e}")
+# ---------- Join request yakalayıcı ----------
+async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    req = update.chat_join_request
+    user: User = req.from_user
+    chat = req.chat
 
-# ---------- DM’den toplu onay/ret (doğrudan API ile) ----------
-async def _bulk_core(update: Update, context: ContextTypes.DEFAULT_TYPE,
-                     chat_id: int, limit: Optional[int], approve: bool) -> None:
-    done = 0
-    page = 0
-    await update.message.reply_text(
-        f"{'Onay' if approve else 'Ret'} başlıyor… "
-        f"{'Limit: ' + str(limit) if limit else 'Limit yok (tümü)'}"
-    )
-    while True:
-        try:
-            reqs = await context.bot.get_chat_join_requests(chat_id=chat_id, limit=200)
-        except RetryAfter as e:
-            await asyncio.sleep(int(getattr(e, "retry_after", 3)) or 3)
-            continue
-        except Forbidden:
-            return await update.message.reply_text("Botun yetkisi yok (Üyelik isteklerini yönet).")
-        except Exception as e:
-            logger.exception("get_chat_join_requests: %s", e)
-            return await update.message.reply_text("İstek listesi alınamadı.")
+    # listelerde tut
+    known_chats.setdefault(chat.id, chat.title or f"{chat.type}:{chat.id}")
+    pending.setdefault(chat.id, {})[user.id] = user
 
-        if not reqs:
-            break
+    # Adminlere DM ile haber ver (isteğe bağlı, burada logluyoruz)
+    logger.info("JoinRequest: chat=%s user=%s", chat.id, user.id)
 
-        for r in reqs:
-            if limit and done >= limit:
-                break
-            await _rate_limit()
-            ok = await (safe_approve(context, chat_id, r.user.id) if approve
-                        else safe_decline(context, chat_id, r.user.id))
-            if ok:
-                done += 1
+# ---------- Callback (kullanılmıyor ama ileride butonlar için) ----------
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer()
 
-        if limit and done >= limit:
-            break
-
-        page += 1
-        await asyncio.sleep(0.5)
-
-    await update.message.reply_text(f"✅ Bitti. {'Onaylanan' if approve else 'Reddedilen'}: {done}")
-
-async def approveall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        return await update.message.reply_text("⛔ Yetkisiz.")
-    # /approveall [adet] <chat_id>
-    args = context.args[:]
-    count = None
-    if args and args[0].isdigit():
-        count = int(args.pop(0))
-        if count <= 0:
-            return await update.message.reply_text("Pozitif bir sayı veriniz.")
-    chat_id = _resolve_chat_id(update, args)
-    if chat_id is None:
-        return await update.message.reply_text("Kullanım: /approveall [adet] <chat_id>")
-    await _bulk_core(update, context, chat_id, limit=count, approve=True)
-
-async def declineall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not _is_admin(update.effective_user.id):
-        return await update.message.reply_text("⛔ Yetkisiz.")
-    # /declineall [adet] <chat_id>
-    args = context.args[:]
-    count = None
-    if args and args[0].isdigit():
-        count = int(args.pop(0))
-        if count <= 0:
-            return await update.message.reply_text("Pozitif bir sayı veriniz.")
-    chat_id = _resolve_chat_id(update, args)
-    if chat_id is None:
-        return await update.message.reply_text("Kullanım: /declineall [adet] <chat_id>")
-    await _bulk_core(update, context, chat_id, limit=count, approve=False)
-
-# ---------- App ----------
+# ---------- main ----------
 def main() -> None:
     app = Application.builder().token(BOT_TOKEN).build()
 
-    # Temel
+    # DM komutları
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler(["id", "kimim"], my_id))
+    app.add_handler(CommandHandler("chatid", chatid_cmd))
+    app.add_handler(CommandHandler("istek", istek_cmd))
+    app.add_handler(CommandHandler(["sec", "seç"], sec_cmd))
+    app.add_handler(CommandHandler("onayla", onayla_cmd))
 
-    # DM yönetim komutları
-    app.add_handler(CommandHandler("status", status_cmd))
-    app.add_handler(CommandHandler("syncrequests", syncrequests))
-    app.add_handler(CommandHandler("approveall", approveall))
-    app.add_handler(CommandHandler("declineall", declineall))
-
-    # Gerçek zamanlı istek + buton
+    # Join request
     app.add_handler(ChatJoinRequestHandler(on_join_request))
+
+    # (İleride buton kullanırsak)
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    logger.info("Bot başlıyor… admins=%s rate=%s/s", ",".join(map(str, ADMIN_IDS)), MAX_RATE_PER_SEC)
-    app.run_polling()
+    logger.info("Bot başlıyor…")
+    app.run_polling(close_loop=False)
 
 if __name__ == "__main__":
+    try:
+        asyncio.run(asyncio.sleep(0))
+    except RuntimeError:
+        pass
     main()
