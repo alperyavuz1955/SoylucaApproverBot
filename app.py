@@ -2,7 +2,7 @@
 Telegram İstek Onaylayıcı Bot (Butonlu Onay)
 ---------------------------------
 • Amaç: Grup/kanal “İstekle katılım” açıkken gelen üyelik isteklerini admin butonlarıyla onaylamak/reddetmek.
-• Kütüphane: python-telegram-bot==21.6
+• Kütüphane: python-telegram-bot >= 21.7
 • Çalıştırma: BOT_TOKEN=xxxxx ADMIN_IDS=111,222 python app.py
 
 Nasıl çalışır?
@@ -15,9 +15,10 @@ Notlar:
 - ADMIN_IDS env değişkenine admin Telegram user_id’lerini yaz (virgülle ayır).
 """
 
-import asyncio
 import logging
 import os
+from typing import Dict, Tuple
+
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -45,11 +46,13 @@ if not BOT_TOKEN:
     raise SystemExit("BOT_TOKEN env değişkeni zorunludur.")
 
 # Bekleyen istekler: {user_id: (chat_id, user)}
-pending_requests = {}
+pending_requests: Dict[int, Tuple[int, "telegram.User"]] = {}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("Merhaba! Ben butonlu onay botuyum. /id yazarak user_id'ni öğrenebilirsin.")
+    await update.message.reply_text(
+        "Merhaba! Ben butonlu onay botuyum. /id yazarak user_id'ni öğrenebilirsin."
+    )
 
 
 async def my_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -70,12 +73,10 @@ async def on_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     pending_requests[user.id] = (chat.id, user)
 
     keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("✅ Onayla", callback_data=f"approve:{chat.id}:{user.id}"),
-                InlineKeyboardButton("❌ Reddet", callback_data=f"decline:{chat.id}:{user.id}"),
-            ]
-        ]
+        [[
+            InlineKeyboardButton("✅ Onayla", callback_data=f"approve:{chat.id}:{user.id}"),
+            InlineKeyboardButton("❌ Reddet", callback_data=f"decline:{chat.id}:{user.id}"),
+        ]]
     )
 
     text = (
@@ -145,8 +146,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(asyncio.sleep(0))
-    except RuntimeError:
-        pass
     main()
