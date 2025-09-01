@@ -1,3 +1,1 @@
 python-telegram-bot==21.7
-httpx==0.28.*
-anyio==4.*
